@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import TokenArcCanvas from "../components/TokenArcCanvas";
+import AttentionHeatmap from "../components/AttentionHeatmap";
 import { getAttention } from "../api";
 
 export default function Visualize({ models, selectedModel }) {
@@ -52,58 +53,74 @@ export default function Visualize({ models, selectedModel }) {
 
       {error && <p className="status-text" style={{ color: "#e24b4a" }}>{error}</p>}
 
-      <div className="canvas">
-        <div className="stream-badge">
-          <span className="stream-dot"></span>
-          Active head stream
-        </div>
-        <div className="status-text" style={{ marginBottom: 8, textAlign: "center" }}>
-          {modelInfo
-            ? `${modelInfo.name} · ${modelInfo.n_embd}d · ${modelInfo.n_layer}L · ${modelInfo.n_head}H · val loss ${modelInfo.val_loss.toFixed(4)}`
-            : "loading model info..."}
-        </div>
+      <div style={{ display: "grid", gridTemplateColumns: data ? "1fr 220px" : "1fr", gap: 16 }}>
+        <div className="canvas" style={{ minWidth: 0 }}>
+          <div className="stream-badge">
+            <span className="stream-dot"></span>
+            Active head stream
+          </div>
+          <div className="status-text" style={{ marginBottom: 8, textAlign: "center" }}>
+            {modelInfo
+              ? `${modelInfo.name} · ${modelInfo.n_embd}d · ${modelInfo.n_layer}L · ${modelInfo.n_head}H · val loss ${modelInfo.val_loss.toFixed(4)}`
+              : "loading model info..."}
+          </div>
 
-        {data ? (
-          <TokenArcCanvas
-            tokens={data.tokens}
-            attention={data.attention}
-            layer={layer}
-            head={head}
-            focusIndex={focusIndex}
-            onFocusChange={setFocusIndex}
-          />
-        ) : (
-          <p className="status-text">Enter text and hit Visualize to see attention.</p>
-        )}
+          {data ? (
+            <>
+              <p className="click-hint">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path d="M9 9l6 6M9 15l6-6" strokeLinecap="round" />
+                </svg>
+                Click any token to see what it attends to
+              </p>
+              <TokenArcCanvas
+                tokens={data.tokens}
+                attention={data.attention}
+                layer={layer}
+                head={head}
+                focusIndex={focusIndex}
+                onFocusChange={setFocusIndex}
+              />
+            </>
+          ) : (
+            <p className="status-text">Enter text and hit Visualize to see attention.</p>
+          )}
+
+          {data && (
+            <div className="controls">
+              <div className="slider-group">
+                <div className="row">
+                  <span>Layer</span>
+                  <span className="value">{layer + 1} / {data.n_layer}</span>
+                </div>
+                <input
+                  type="range"
+                  min={0}
+                  max={data.n_layer - 1}
+                  value={layer}
+                  onChange={(e) => setLayer(Number(e.target.value))}
+                />
+              </div>
+              <div className="slider-group">
+                <div className="row">
+                  <span>Head</span>
+                  <span className="value">{head + 1} / {data.n_head}</span>
+                </div>
+                <input
+                  type="range"
+                  min={0}
+                  max={data.n_head - 1}
+                  value={head}
+                  onChange={(e) => setHead(Number(e.target.value))}
+                />
+              </div>
+            </div>
+          )}
+        </div>
 
         {data && (
-          <div className="controls">
-            <div className="slider-group">
-              <div className="row">
-                <span>Layer</span>
-                <span className="value">{layer + 1} / {data.n_layer}</span>
-              </div>
-              <input
-                type="range"
-                min={0}
-                max={data.n_layer - 1}
-                value={layer}
-                onChange={(e) => setLayer(Number(e.target.value))}
-              />
-            </div>
-            <div className="slider-group">
-              <div className="row">
-                <span>Head</span>
-                <span className="value">{head + 1} / {data.n_head}</span>
-              </div>
-              <input
-                type="range"
-                min={0}
-                max={data.n_head - 1}
-                value={head}
-                onChange={(e) => setHead(Number(e.target.value))}
-              />
-            </div>
+          <div className="canvas" style={{ padding: 16, minWidth: 0 }}>
+            <AttentionHeatmap tokens={data.tokens} attention={data.attention} layer={layer} head={head} />
           </div>
         )}
       </div>

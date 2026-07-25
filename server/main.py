@@ -1,11 +1,12 @@
 """
 FastAPI inference server for MicroGPT.
 
-Loads whichever trained checkpoints are available in checkpoints/ at startup,
-and serves tokenization, attention-weight extraction, and text generation.
+Loads whichever trained checkpoints are available in checkpoints/ at startup.
+Supports both char-level and BPE (word-level) checkpoints -- tokenizer type
+is auto-detected from what's saved inside each checkpoint file.
 
 Run with:
-    uvicorn server.main:app --reload
+    python -m uvicorn server.main:app --reload --port 8080
 """
 
 import os
@@ -19,7 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
 from model.gpt import GPTLanguageModel
-from model.tokenizer import CharTokenizer
+from model.tokenizer import BPETokenizer, CharTokenizer
 from server.schemas import (
     TokenizeRequest, TokenizeResponse,
     AttentionRequest, AttentionResponse,
@@ -33,23 +34,23 @@ app = FastAPI(title="MicroGPT Attention X-Ray API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # tighten this before deploying publicly
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# name -> {"model": GPTLanguageModel, "tokenizer": CharTokenizer, "config": dict, "val_loss": float}
 LOADED_MODELS = {}
 
 
-def build_fallback_tokenizer():
-    """Rebuild the tokenizer from the raw data files. Used when a checkpoint
-    was saved before stoi/itos were included in the saved dict."""
-    with open("data/train.txt", "r", encoding="utf-8") as f:
-        train_text = f.read()
-    with open("data/val.txt", "r", encoding="utf-8") as f:
-        val_text = f.read()
-    return CharTokenizer(train_text + val_text)
+def build_tokenizer_from_checkpoint(tok_dict):
+    tok_type = tok_dict.get("type")
+    if tok_type == "bpe":
+        return BPETokenizer.from_dict(tok_dict)
+    if tok_type == "char":
+        return CharTokenizer.from_dict(tok_dict)
+    if "merges" in tok_dict:
+        return BPETokenizer.from_dict(tok_dict)
+    return CharTokenizer.from_dict(tok_dict)
 
 
 def load_checkpoint(name, filename):
@@ -71,18 +72,29 @@ def load_checkpoint(name, filename):
     model.to(DEVICE)
     model.eval()
 
-    if "stoi" in checkpoint and "itos" in checkpoint:
-        tokenizer = CharTokenizer.__new__(CharTokenizer)  # bypass __init__, restore directly
-        tokenizer.stoi = checkpoint["stoi"]
-        tokenizer.itos = {int(k): v for k, v in checkpoint["itos"].items()}
-        tokenizer.vocab_size = config["vocab_size"]
+    tok_dict = checkpoint.get("tokenizer")
+    if tok_dict is not None:
+        tokenizer = build_tokenizer_from_checkpoint(tok_dict)
+    elif "stoi" in checkpoint and "itos" in checkpoint:
+        tokenizer = CharTokenizer.from_dict({
+            "stoi": checkpoint["stoi"],
+            "itos": {str(k): v for k, v in checkpoint["itos"].items()},
+            "vocab_size": config["vocab_size"],
+        })
     else:
         print(f"  '{name}' checkpoint has no saved tokenizer -- rebuilding from data files")
-        tokenizer = build_fallback_tokenizer()
+        with open("data/train.txt", "r", encoding="utf-8") as f:
+            train_text = f.read()
+        with open("data/val.txt", "r", encoding="utf-8") as f:
+            val_text = f.read()
+        tokenizer = CharTokenizer(train_text + val_text)
+
+    tokenizer_type = "bpe" if isinstance(tokenizer, BPETokenizer) else "char"
 
     return {
         "model": model,
         "tokenizer": tokenizer,
+        "tokenizer_type": tokenizer_type,
         "config": config,
         "val_loss": float(checkpoint.get("val_loss", -1)),
     }
@@ -91,15 +103,21 @@ def load_checkpoint(name, filename):
 @app.on_event("startup")
 def startup():
     candidates = {
-        "micro": "checkpoint_micro.pt",
-        "small": "checkpoint_small.pt",
-        "medium": "checkpoint_medium.pt",
+        "small-char": "checkpoint_small_char.pt",
+        "medium-char": "checkpoint_medium_char.pt",
+        "small-word": "checkpoint_small_word.pt",
+        "medium-word": "checkpoint_medium_word.pt",
     }
     for name, filename in candidates.items():
-        loaded = load_checkpoint(name, filename)
+        try:
+            loaded = load_checkpoint(name, filename)
+        except Exception as e:
+            print(f"  failed to load '{name}' from {filename}: {e}")
+            continue
         if loaded is not None:
             LOADED_MODELS[name] = loaded
-            print(f"loaded '{name}' (val_loss={loaded['val_loss']:.4f})")
+            print(f"loaded '{name}' ({loaded['tokenizer_type']}, "
+                  f"val_loss={loaded['val_loss']:.4f}, vocab_size={loaded['config']['vocab_size']})")
     if not LOADED_MODELS:
         print(f"WARNING: no checkpoints found in {CHECKPOINT_DIR}/")
 
@@ -124,6 +142,7 @@ def list_models():
             n_layer=entry["config"]["n_layer"],
             block_size=entry["config"]["block_size"],
             val_loss=entry["val_loss"],
+            tokenizer_type=entry["tokenizer_type"],
         )
         for name, entry in LOADED_MODELS.items()
     ]
@@ -131,14 +150,12 @@ def list_models():
 
 @app.post("/tokenize", response_model=TokenizeResponse)
 def tokenize(req: TokenizeRequest):
-    # tokenizer is shared vocab across checkpoints trained on the same data,
-    # so any loaded model's tokenizer works here
     if not LOADED_MODELS:
         raise HTTPException(status_code=503, detail="no models loaded")
     tokenizer = next(iter(LOADED_MODELS.values()))["tokenizer"]
 
     token_ids = tokenizer.encode(req.text)
-    tokens = [req.text[i] for i in range(len(req.text))]
+    tokens = [tokenizer.itos[i] for i in token_ids]
     return TokenizeResponse(tokens=tokens, token_ids=token_ids)
 
 
@@ -147,16 +164,14 @@ def get_attention(req: AttentionRequest):
     entry = get_model_or_404(req.model)
     model, tokenizer, config = entry["model"], entry["tokenizer"], entry["config"]
 
-    text = req.text[-config["block_size"]:]   # truncate to what the model can see
-    token_ids = tokenizer.encode(text)
+    token_ids = tokenizer.encode(req.text)[-config["block_size"]:]
     idx = torch.tensor([token_ids], dtype=torch.long, device=DEVICE)
 
     with torch.no_grad():
         _, _, attentions = model(idx, return_attention=True)
-        # attentions: (n_layer, B=1, n_head, T, T) -> drop batch dim, move to cpu list
         attentions = attentions[:, 0, :, :, :].cpu().tolist()
 
-    tokens = list(text)
+    tokens = [tokenizer.itos[i] for i in token_ids]
     return AttentionResponse(
         tokens=tokens,
         attention=attentions,
@@ -193,11 +208,11 @@ async def generate(req: GenerateRequest):
             idx = torch.cat((idx, idx_next), dim=1)
 
             token_id = idx_next.item()
-            char = tokenizer.itos[token_id]
-            last_layer_attn = attentions[-1, 0, :, -1, :].cpu().tolist()  # last layer, last token's attention row, all heads
+            piece = tokenizer.itos[token_id]
+            last_layer_attn = attentions[-1, 0, :, -1, :].cpu().tolist()
 
-            payload = {"token": char, "token_id": token_id, "attention_row": last_layer_attn}
+            payload = {"token": piece, "token_id": token_id, "attention_row": last_layer_attn}
             yield f"data: {json.dumps(payload)}\n\n"
-            await asyncio.sleep(0)  # yield control so the stream actually flushes
+            await asyncio.sleep(0)
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")

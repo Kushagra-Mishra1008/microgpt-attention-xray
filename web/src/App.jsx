@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import "./theme.css";
+import Sidebar from "./components/Sidebar";
 import Visualize from "./pages/Visualize";
 import Generate from "./pages/Generate";
 import { getModels } from "./api";
@@ -7,16 +8,22 @@ import { getModels } from "./api";
 export default function App() {
   const [tab, setTab] = useState("visualize");
   const [models, setModels] = useState([]);
-  const [selectedModel, setSelectedModel] = useState(null);
+  const [family, setFamily] = useState("word");
+  const [size, setSize] = useState("small");
 
   useEffect(() => {
-    getModels()
-      .then((list) => {
-        setModels(list);
-        if (list.length) setSelectedModel(list[0].name);
-      })
-      .catch((e) => console.error("failed to load models:", e));
+    getModels().then(setModels).catch((e) => console.error("failed to load models:", e));
   }, []);
+
+  const selectedModel = `${size}-${family}`;
+  const modelInfo = models.find((m) => m.name === selectedModel);
+  const modelExists = !!modelInfo;
+
+  const familiesAvailable = {
+    char: models.some((m) => m.name.endsWith("-char")),
+    word: models.some((m) => m.name.endsWith("-word")),
+  };
+  const sizesForFamily = (fam) => models.filter((m) => m.name.endsWith(`-${fam}`)).map((m) => m.name.split("-")[0]);
 
   return (
     <div className="app-shell">
@@ -33,29 +40,46 @@ export default function App() {
           </div>
         </div>
 
-        <div className="model-toggle">
-          {models.map((m) => (
-            <button
-              key={m.name}
-              className={selectedModel === m.name ? "active" : ""}
-              onClick={() => setSelectedModel(m.name)}
-            >
-              {m.name}
-            </button>
-          ))}
+        <div style={{ display: "flex", flexDirection: "column", gap: 6, alignItems: "flex-end" }}>
+          <div className="model-toggle">
+            {["word", "char"].map((f) => (
+              <button
+                key={f}
+                className={family === f ? "active" : ""}
+                disabled={!familiesAvailable[f]}
+                style={!familiesAvailable[f] ? { opacity: 0.3, cursor: "default" } : {}}
+                onClick={() => setFamily(f)}
+              >
+                {f === "word" ? "Word" : "Character"}
+              </button>
+            ))}
+          </div>
+          <div className="model-toggle" style={{ padding: 3 }}>
+            {sizesForFamily(family).map((s) => (
+              <button key={s} className={size === s ? "active" : ""} onClick={() => setSize(s)}>
+                {s}
+              </button>
+            ))}
+          </div>
         </div>
       </div>
 
-      <div className="main">
-        {selectedModel ? (
-          tab === "visualize" ? (
-            <Visualize models={models} selectedModel={selectedModel} />
+      <div style={{ display: "flex", flex: 1, minWidth: 0 }}>
+        <Sidebar modelInfo={modelInfo} />
+
+        <div className="main" style={{ flex: 1, minWidth: 0 }}>
+          {modelExists ? (
+            tab === "visualize" ? (
+              <Visualize models={models} selectedModel={selectedModel} />
+            ) : (
+              <Generate selectedModel={selectedModel} />
+            )
           ) : (
-            <Generate selectedModel={selectedModel} />
-          )
-        ) : (
-          <p className="status-text">Loading models from server...</p>
-        )}
+            <p className="status-text">
+              {models.length ? `Model '${selectedModel}' not available yet.` : "Loading models from server..."}
+            </p>
+          )}
+        </div>
       </div>
     </div>
   );

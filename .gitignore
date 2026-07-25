@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# Data & checkpoints (regenerable / too large for git)
+data/*.txt
+data/*.bin
+checkpoints/
+*.pt
+*.ckpt
+
+# Node / frontend
+web/node_modules/
+web/dist/
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
+
+# Colab
+.ipynb_checkpoints/

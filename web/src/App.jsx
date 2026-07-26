@@ -10,7 +10,7 @@ export default function App() {
   const [tab, setTab] = useState("visualize");
   const [page, setPage] = useState("app");
   const [models, setModels] = useState([]);
-  const [family, setFamily] = useState("word");
+  const [family, setFamily] = useState("char");
   const [size, setSize] = useState("small");
 
   useEffect(() => {

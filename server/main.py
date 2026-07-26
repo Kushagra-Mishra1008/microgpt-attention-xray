@@ -1,11 +1,12 @@
 """
 FastAPI inference server for MicroGPT.
 
-Lazy-loads at most ONE model checkpoint into memory at a time -- this keeps
-RAM usage bounded for free-tier hosting (Render's free tier caps at 512MB,
-and eagerly loading all four checkpoints together OOMs it). Model metadata
-for /models is hardcoded so listing available models never requires a
-download or a load.
+At startup: pre-downloads all checkpoint FILES to disk in a background
+thread (so a live request never has to wait on a slow network download
+inside its own timeout window), but doesn't load any of them into memory
+yet. Models are lazy-loaded into RAM one at a time on first actual use --
+this keeps RAM usage bounded for free-tier hosting (Render's free tier caps
+at 512MB, and eagerly loading all four checkpoints together OOMs it).
 
 Run with:
     python -m uvicorn server.main:app --reload --port 8080
@@ -15,6 +16,7 @@ import os
 import gc
 import json
 import asyncio
+import threading
 import urllib.request
 
 import torch
@@ -67,7 +69,9 @@ def ensure_checkpoint_downloaded(filename):
 
     url = f"{HF_BASE_URL}/{filename}"
     print(f"  downloading {filename} from Hugging Face Hub...")
-    urllib.request.urlretrieve(url, path)
+    tmp_path = path + ".partial"
+    urllib.request.urlretrieve(url, tmp_path)
+    os.replace(tmp_path, path)  # atomic-ish: avoid a half-downloaded file being treated as complete
     print(f"  done: {filename}")
     return path
 
@@ -170,6 +174,16 @@ def startup():
         print(f"loaded corpus text ({len(CORPUS_TEXT):,} characters)")
     except FileNotFoundError:
         print("WARNING: could not load corpus text -- /corpus will be empty")
+
+    def predownload_all():
+        for name, reg in MODEL_REGISTRY.items():
+            try:
+                ensure_checkpoint_downloaded(reg["filename"])
+            except Exception as e:
+                print(f"  pre-download failed for '{name}': {e}")
+        print("  all checkpoints pre-downloaded to disk.")
+
+    threading.Thread(target=predownload_all, daemon=True).start()
 
 
 @app.get("/health")

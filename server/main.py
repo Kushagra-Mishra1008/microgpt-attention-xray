@@ -1,16 +1,18 @@
 """
 FastAPI inference server for MicroGPT.
 
-On startup: downloads any missing checkpoint files from Hugging Face Hub,
-downloads the training corpus if missing, then loads whatever checkpoints
-are available. Supports both char-level and BPE (word-level) checkpoints --
-tokenizer type is auto-detected from what's saved inside each checkpoint.
+Lazy-loads at most ONE model checkpoint into memory at a time -- this keeps
+RAM usage bounded for free-tier hosting (Render's free tier caps at 512MB,
+and eagerly loading all four checkpoints together OOMs it). Model metadata
+for /models is hardcoded so listing available models never requires a
+download or a load.
 
 Run with:
     python -m uvicorn server.main:app --reload --port 8080
 """
 
 import os
+import gc
 import json
 import asyncio
 import urllib.request
@@ -37,6 +39,13 @@ HF_BASE_URL = f"https://huggingface.co/{HF_REPO}/resolve/main"
 
 SHAKESPEARE_URL = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
 
+MODEL_REGISTRY = {
+    "small-char":  {"filename": "checkpoint_small_char.pt",  "tokenizer_type": "char", "n_embd": 384, "n_head": 6, "n_layer": 6, "block_size": 256, "vocab_size": 65,   "val_loss": 1.5414},
+    "medium-char": {"filename": "checkpoint_medium_char.pt", "tokenizer_type": "char", "n_embd": 512, "n_head": 8, "n_layer": 8, "block_size": 256, "vocab_size": 65,   "val_loss": 1.4852},
+    "small-word":  {"filename": "checkpoint_small_word.pt",  "tokenizer_type": "bpe",  "n_embd": 384, "n_head": 6, "n_layer": 6, "block_size": 256, "vocab_size": 3065, "val_loss": 4.5400},
+    "medium-word": {"filename": "checkpoint_medium_word.pt", "tokenizer_type": "bpe",  "n_embd": 512, "n_head": 8, "n_layer": 8, "block_size": 256, "vocab_size": 3065, "val_loss": 4.5671},
+}
+
 app = FastAPI(title="MicroGPT Attention X-Ray API")
 
 app.add_middleware(
@@ -46,7 +55,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-LOADED_MODELS = {}
+CURRENT = None
 CORPUS_TEXT = ""
 
 
@@ -58,15 +67,9 @@ def ensure_checkpoint_downloaded(filename):
 
     url = f"{HF_BASE_URL}/{filename}"
     print(f"  downloading {filename} from Hugging Face Hub...")
-    try:
-        urllib.request.urlretrieve(url, path)
-        print(f"  done: {filename}")
-        return path
-    except Exception as e:
-        print(f"  failed to download {filename}: {e}")
-        if os.path.exists(path):
-            os.remove(path)
-        return None
+    urllib.request.urlretrieve(url, path)
+    print(f"  done: {filename}")
+    return path
 
 
 def ensure_data_downloaded():
@@ -76,7 +79,7 @@ def ensure_data_downloaded():
     if os.path.exists(train_path) and os.path.exists(val_path):
         return
 
-    print("  data/train.txt or data/val.txt missing -- downloading Tiny Shakespeare...")
+    print("  downloading Tiny Shakespeare...")
     raw_path = os.path.join("data", "shakespeare.txt")
     urllib.request.urlretrieve(SHAKESPEARE_URL, raw_path)
     with open(raw_path, "r", encoding="utf-8") as f:
@@ -101,11 +104,23 @@ def build_tokenizer_from_checkpoint(tok_dict):
     return CharTokenizer.from_dict(tok_dict)
 
 
-def load_checkpoint(name, filename):
-    path = ensure_checkpoint_downloaded(filename)
-    if path is None or not os.path.exists(path):
-        return None
+def get_model(name):
+    global CURRENT
 
+    if name not in MODEL_REGISTRY:
+        raise HTTPException(status_code=404, detail=f"unknown model '{name}'. available: {list(MODEL_REGISTRY.keys())}")
+
+    if CURRENT is not None and CURRENT["name"] == name:
+        return CURRENT
+
+    if CURRENT is not None:
+        print(f"  evicting '{CURRENT['name']}' to load '{name}'")
+        del CURRENT["model"]
+        CURRENT = None
+        gc.collect()
+
+    reg = MODEL_REGISTRY[name]
+    path = ensure_checkpoint_downloaded(reg["filename"])
     checkpoint = torch.load(path, map_location=DEVICE, weights_only=False)
     config = checkpoint["config"]
 
@@ -130,7 +145,6 @@ def load_checkpoint(name, filename):
             "vocab_size": config["vocab_size"],
         })
     else:
-        print(f"  '{name}' checkpoint has no saved tokenizer -- rebuilding from data files")
         ensure_data_downloaded()
         with open("data/train.txt", "r", encoding="utf-8") as f:
             train_text = f.read()
@@ -138,42 +152,15 @@ def load_checkpoint(name, filename):
             val_text = f.read()
         tokenizer = CharTokenizer(train_text + val_text)
 
-    tokenizer_type = "bpe" if isinstance(tokenizer, BPETokenizer) else "char"
-
-    return {
-        "model": model,
-        "tokenizer": tokenizer,
-        "tokenizer_type": tokenizer_type,
-        "config": config,
-        "val_loss": float(checkpoint.get("val_loss", -1)),
-    }
+    print(f"  loaded '{name}'")
+    CURRENT = {"name": name, "model": model, "tokenizer": tokenizer, "config": config}
+    return CURRENT
 
 
 @app.on_event("startup")
 def startup():
     global CORPUS_TEXT
-
     ensure_data_downloaded()
-
-    candidates = {
-        "small-char": "checkpoint_small_char.pt",
-        "medium-char": "checkpoint_medium_char.pt",
-        "small-word": "checkpoint_small_word.pt",
-        "medium-word": "checkpoint_medium_word.pt",
-    }
-    for name, filename in candidates.items():
-        try:
-            loaded = load_checkpoint(name, filename)
-        except Exception as e:
-            print(f"  failed to load '{name}' from {filename}: {e}")
-            continue
-        if loaded is not None:
-            LOADED_MODELS[name] = loaded
-            print(f"loaded '{name}' ({loaded['tokenizer_type']}, "
-                  f"val_loss={loaded['val_loss']:.4f}, vocab_size={loaded['config']['vocab_size']})")
-    if not LOADED_MODELS:
-        print(f"WARNING: no checkpoints could be loaded")
-
     try:
         with open("data/train.txt", "r", encoding="utf-8") as f:
             train_text = f.read()
@@ -187,17 +174,7 @@ def startup():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "models_loaded": list(LOADED_MODELS.keys())}
-
-
-def get_model_or_404(name):
-    if name not in LOADED_MODELS:
-        available = list(LOADED_MODELS.keys())
-        raise HTTPException(
-            status_code=404,
-            detail=f"model '{name}' not loaded. available: {available}",
-        )
-    return LOADED_MODELS[name]
+    return {"status": "ok", "current_model": CURRENT["name"] if CURRENT else None}
 
 
 @app.get("/models", response_model=list[ModelInfo])
@@ -205,14 +182,14 @@ def list_models():
     return [
         ModelInfo(
             name=name,
-            n_embd=entry["config"]["n_embd"],
-            n_head=entry["config"]["n_head"],
-            n_layer=entry["config"]["n_layer"],
-            block_size=entry["config"]["block_size"],
-            val_loss=entry["val_loss"],
-            tokenizer_type=entry["tokenizer_type"],
+            n_embd=reg["n_embd"],
+            n_head=reg["n_head"],
+            n_layer=reg["n_layer"],
+            block_size=reg["block_size"],
+            val_loss=reg["val_loss"],
+            tokenizer_type=reg["tokenizer_type"],
         )
-        for name, entry in LOADED_MODELS.items()
+        for name, reg in MODEL_REGISTRY.items()
     ]
 
 
@@ -227,9 +204,8 @@ def get_corpus():
 
 @app.post("/tokenize", response_model=TokenizeResponse)
 def tokenize(req: TokenizeRequest):
-    if not LOADED_MODELS:
-        raise HTTPException(status_code=503, detail="no models loaded")
-    tokenizer = next(iter(LOADED_MODELS.values()))["tokenizer"]
+    entry = get_model(req.model)
+    tokenizer = entry["tokenizer"]
 
     token_ids = tokenizer.encode(req.text)
     tokens = [tokenizer.itos[i] for i in token_ids]
@@ -238,7 +214,7 @@ def tokenize(req: TokenizeRequest):
 
 @app.post("/attention", response_model=AttentionResponse)
 def get_attention(req: AttentionRequest):
-    entry = get_model_or_404(req.model)
+    entry = get_model(req.model)
     model, tokenizer, config = entry["model"], entry["tokenizer"], entry["config"]
 
     token_ids = tokenizer.encode(req.text)[-config["block_size"]:]
@@ -268,7 +244,7 @@ def sample_next_token(logits, temperature, top_k):
 
 @app.post("/generate")
 async def generate(req: GenerateRequest):
-    entry = get_model_or_404(req.model)
+    entry = get_model(req.model)
     model, tokenizer, config = entry["model"], entry["tokenizer"], entry["config"]
     block_size = config["block_size"]
 

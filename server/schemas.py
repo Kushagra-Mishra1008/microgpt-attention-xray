@@ -42,3 +42,4 @@ class ModelInfo(BaseModel):
     block_size: int
     val_loss: Optional[float] = None
     tokenizer_type: str = "char"
+    ready: bool = True

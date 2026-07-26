@@ -5,8 +5,9 @@ At startup: pre-downloads all checkpoint FILES to disk in a background
 thread (so a live request never has to wait on a slow network download
 inside its own timeout window), but doesn't load any of them into memory
 yet. Models are lazy-loaded into RAM one at a time on first actual use --
-this keeps RAM usage bounded for free-tier hosting (Render's free tier caps
-at 512MB, and eagerly loading all four checkpoints together OOMs it).
+this keeps RAM usage bounded for free-tier hosting. /models reports whether
+each checkpoint file is actually present on disk yet, so the frontend can
+show a "still preparing" state instead of a raw error.
 
 Run with:
     python -m uvicorn server.main:app --reload --port 8080
@@ -61,9 +62,17 @@ CURRENT = None
 CORPUS_TEXT = ""
 
 
+def checkpoint_path(filename):
+    return os.path.join(CHECKPOINT_DIR, filename)
+
+
+def is_downloaded(filename):
+    return os.path.exists(checkpoint_path(filename))
+
+
 def ensure_checkpoint_downloaded(filename):
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    path = os.path.join(CHECKPOINT_DIR, filename)
+    path = checkpoint_path(filename)
     if os.path.exists(path):
         return path
 
@@ -71,7 +80,7 @@ def ensure_checkpoint_downloaded(filename):
     print(f"  downloading {filename} from Hugging Face Hub...")
     tmp_path = path + ".partial"
     urllib.request.urlretrieve(url, tmp_path)
-    os.replace(tmp_path, path)  # atomic-ish: avoid a half-downloaded file being treated as complete
+    os.replace(tmp_path, path)
     print(f"  done: {filename}")
     return path
 
@@ -202,6 +211,7 @@ def list_models():
             block_size=reg["block_size"],
             val_loss=reg["val_loss"],
             tokenizer_type=reg["tokenizer_type"],
+            ready=is_downloaded(reg["filename"]),
         )
         for name, reg in MODEL_REGISTRY.items()
     ]

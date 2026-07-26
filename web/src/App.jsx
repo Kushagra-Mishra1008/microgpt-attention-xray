@@ -14,12 +14,23 @@ export default function App() {
   const [size, setSize] = useState("small");
 
   useEffect(() => {
-    getModels().then(setModels).catch((e) => console.error("failed to load models:", e));
+    let cancelled = false;
+
+    function poll() {
+      getModels()
+        .then((list) => { if (!cancelled) setModels(list); })
+        .catch((e) => console.error("failed to load models:", e));
+    }
+
+    poll();
+    const interval = setInterval(poll, 5000); // re-check readiness every 5s
+    return () => { cancelled = true; clearInterval(interval); };
   }, []);
 
   const selectedModel = `${size}-${family}`;
   const modelInfo = models.find((m) => m.name === selectedModel);
   const modelExists = !!modelInfo;
+  const modelReady = modelInfo?.ready ?? false;
 
   const familiesAvailable = {
     char: models.some((m) => m.name.endsWith("-char")),
@@ -65,16 +76,22 @@ export default function App() {
         <div className="main" style={{ flex: 1, minWidth: 0, overflowY: "auto" }}>
           {page === "info" ? (
             <ModelInfoPage modelInfo={modelInfo} />
-          ) : modelExists ? (
-            tab === "visualize" ? (
-              <Visualize models={models} selectedModel={selectedModel} />
-            ) : (
-              <Generate selectedModel={selectedModel} />
-            )
-          ) : (
+          ) : !modelExists ? (
             <p className="status-text">
-              {models.length ? `Model '${selectedModel}' not available yet.` : "Loading models from server..."}
+              {models.length ? `Model '${selectedModel}' not available.` : "Loading models from server..."}
             </p>
+          ) : !modelReady ? (
+            <div className="canvas" style={{ alignItems: "center", textAlign: "center", gap: 12 }}>
+              <div className="stream-dot" style={{ margin: "0 auto" }}></div>
+              <p style={{ margin: 0 }}>Preparing this model on the server (first time only)...</p>
+              <p className="status-text" style={{ margin: 0 }}>
+                This can take a minute the first time each model is used. Checking again automatically.
+              </p>
+            </div>
+          ) : tab === "visualize" ? (
+            <Visualize models={models} selectedModel={selectedModel} />
+          ) : (
+            <Generate selectedModel={selectedModel} />
           )}
         </div>
       </div>

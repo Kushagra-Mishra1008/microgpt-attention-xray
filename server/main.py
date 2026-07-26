@@ -238,8 +238,18 @@ def list_models():
 
 @app.post("/prepare")
 def prepare_model(req: PrepareRequest):
+    global CURRENT
     if req.model not in MODEL_REGISTRY:
         raise HTTPException(status_code=404, detail=f"unknown model '{req.model}'")
+
+    # Free the currently-loaded model immediately on selection, so we never
+    # hold one model in RAM while downloading a different one -- that overlap
+    # is what pushed memory past 512MB and got the process killed.
+    if CURRENT is not None and CURRENT["name"] != req.model:
+        print(f"  evicting '{CURRENT['name']}' (switched selection before it was requested)")
+        del CURRENT["model"]
+        CURRENT = None
+        gc.collect()
 
     filename = MODEL_REGISTRY[req.model]["filename"]
     if is_downloaded(filename):

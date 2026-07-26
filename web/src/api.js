@@ -22,6 +22,14 @@ export async function getAttention(text, model) {
   return res.json();
 }
 
+export function prepareModel(model) {
+  fetch(`${API_BASE}/prepare`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model }),
+  }).catch(() => {});
+}
+
 export function streamGenerate(req, onToken, onDone) {
   const controller = new AbortController();
 

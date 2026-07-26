@@ -4,7 +4,7 @@ import Sidebar from "./components/Sidebar";
 import Visualize from "./pages/Visualize";
 import Generate from "./pages/Generate";
 import ModelInfoPage from "./pages/ModelInfoPage";
-import { getModels } from "./api";
+import { getModels, prepareModel } from "./api";
 
 export default function App() {
   const [tab, setTab] = useState("visualize");
@@ -13,21 +13,24 @@ export default function App() {
   const [family, setFamily] = useState("char");
   const [size, setSize] = useState("small");
 
+  const selectedModel = `${size}-${family}`;
+
   useEffect(() => {
     let cancelled = false;
-
     function poll() {
       getModels()
         .then((list) => { if (!cancelled) setModels(list); })
         .catch((e) => console.error("failed to load models:", e));
     }
-
     poll();
-    const interval = setInterval(poll, 5000); // re-check readiness every 5s
+    const interval = setInterval(poll, 5000);
     return () => { cancelled = true; clearInterval(interval); };
   }, []);
 
-  const selectedModel = `${size}-${family}`;
+  useEffect(() => {
+    prepareModel(selectedModel);
+  }, [selectedModel]);
+
   const modelInfo = models.find((m) => m.name === selectedModel);
   const modelExists = !!modelInfo;
   const modelReady = modelInfo?.ready ?? false;

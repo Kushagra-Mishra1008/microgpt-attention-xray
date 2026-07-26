@@ -34,6 +34,10 @@ class GenerateRequest(BaseModel):
     model: str = "small-word"
 
 
+class PrepareRequest(BaseModel):
+    model: str
+
+
 class ModelInfo(BaseModel):
     name: str
     n_embd: int

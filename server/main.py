@@ -1,13 +1,17 @@
 """
 FastAPI inference server for MicroGPT.
 
-At startup: pre-downloads all checkpoint FILES to disk in a background
-thread (so a live request never has to wait on a slow network download
-inside its own timeout window), but doesn't load any of them into memory
-yet. Models are lazy-loaded into RAM one at a time on first actual use --
-this keeps RAM usage bounded for free-tier hosting. /models reports whether
-each checkpoint file is actually present on disk yet, so the frontend can
-show a "still preparing" state instead of a raw error.
+Memory safety design (Render free tier caps at 512MB RAM):
+  - At most ONE model is ever loaded into memory at a time (evict-on-switch).
+  - At most ONE checkpoint download ever happens at a time, system-wide,
+    enforced by a global lock -- this is what a previous version got wrong:
+    downloading multiple large files in an overlapping burst spiked memory
+    past the limit and got the process SIGKILLed (exit 137).
+  - Only the default model is pre-downloaded at startup; others download on
+    demand, either via /prepare (fired the moment the frontend selects a
+    model, well before the user submits a request) or synchronously inside
+    the request that actually needs them, whichever gets there first --
+    the lock makes both paths safe together.
 
 Run with:
     python -m uvicorn server.main:app --reload --port 8080
@@ -31,11 +35,12 @@ from model.tokenizer import BPETokenizer, CharTokenizer
 from server.schemas import (
     TokenizeRequest, TokenizeResponse,
     AttentionRequest, AttentionResponse,
-    GenerateRequest, ModelInfo,
+    GenerateRequest, ModelInfo, PrepareRequest,
 )
 
 CHECKPOINT_DIR = "checkpoints"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEFAULT_MODEL = "small-char"
 
 HF_REPO = "Kushagra-Mishra1008/microgpt-attention-xray-checkpoints"
 HF_BASE_URL = f"https://huggingface.co/{HF_REPO}/resolve/main"
@@ -60,6 +65,7 @@ app.add_middleware(
 
 CURRENT = None
 CORPUS_TEXT = ""
+DOWNLOAD_LOCK = threading.Lock()
 
 
 def checkpoint_path(filename):
@@ -71,18 +77,22 @@ def is_downloaded(filename):
 
 
 def ensure_checkpoint_downloaded(filename):
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     path = checkpoint_path(filename)
     if os.path.exists(path):
         return path
 
-    url = f"{HF_BASE_URL}/{filename}"
-    print(f"  downloading {filename} from Hugging Face Hub...")
-    tmp_path = path + ".partial"
-    urllib.request.urlretrieve(url, tmp_path)
-    os.replace(tmp_path, path)
-    print(f"  done: {filename}")
-    return path
+    with DOWNLOAD_LOCK:
+        if os.path.exists(path):
+            return path
+
+        os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+        url = f"{HF_BASE_URL}/{filename}"
+        print(f"  downloading {filename} from Hugging Face Hub...")
+        tmp_path = path + ".partial"
+        urllib.request.urlretrieve(url, tmp_path)
+        os.replace(tmp_path, path)
+        print(f"  done: {filename}")
+        return path
 
 
 def ensure_data_downloaded():
@@ -92,18 +102,21 @@ def ensure_data_downloaded():
     if os.path.exists(train_path) and os.path.exists(val_path):
         return
 
-    print("  downloading Tiny Shakespeare...")
-    raw_path = os.path.join("data", "shakespeare.txt")
-    urllib.request.urlretrieve(SHAKESPEARE_URL, raw_path)
-    with open(raw_path, "r", encoding="utf-8") as f:
-        text = f.read()
+    with DOWNLOAD_LOCK:
+        if os.path.exists(train_path) and os.path.exists(val_path):
+            return
+        print("  downloading Tiny Shakespeare...")
+        raw_path = os.path.join("data", "shakespeare.txt")
+        urllib.request.urlretrieve(SHAKESPEARE_URL, raw_path)
+        with open(raw_path, "r", encoding="utf-8") as f:
+            text = f.read()
 
-    split_idx = int(len(text) * 0.9)
-    with open(train_path, "w", encoding="utf-8") as f:
-        f.write(text[:split_idx])
-    with open(val_path, "w", encoding="utf-8") as f:
-        f.write(text[split_idx:])
-    print("  data ready.")
+        split_idx = int(len(text) * 0.9)
+        with open(train_path, "w", encoding="utf-8") as f:
+            f.write(text[:split_idx])
+        with open(val_path, "w", encoding="utf-8") as f:
+            f.write(text[split_idx:])
+        print("  data ready.")
 
 
 def build_tokenizer_from_checkpoint(tok_dict):
@@ -184,15 +197,14 @@ def startup():
     except FileNotFoundError:
         print("WARNING: could not load corpus text -- /corpus will be empty")
 
-    def predownload_all():
-        for name, reg in MODEL_REGISTRY.items():
-            try:
-                ensure_checkpoint_downloaded(reg["filename"])
-            except Exception as e:
-                print(f"  pre-download failed for '{name}': {e}")
-        print("  all checkpoints pre-downloaded to disk.")
+    def predownload_default():
+        try:
+            ensure_checkpoint_downloaded(MODEL_REGISTRY[DEFAULT_MODEL]["filename"])
+            print(f"  default model '{DEFAULT_MODEL}' pre-downloaded.")
+        except Exception as e:
+            print(f"  pre-download failed for default model: {e}")
 
-    threading.Thread(target=predownload_all, daemon=True).start()
+    threading.Thread(target=predownload_default, daemon=True).start()
 
 
 @app.get("/health")
@@ -215,6 +227,25 @@ def list_models():
         )
         for name, reg in MODEL_REGISTRY.items()
     ]
+
+
+@app.post("/prepare")
+def prepare_model(req: PrepareRequest):
+    if req.model not in MODEL_REGISTRY:
+        raise HTTPException(status_code=404, detail=f"unknown model '{req.model}'")
+
+    filename = MODEL_REGISTRY[req.model]["filename"]
+    if is_downloaded(filename):
+        return {"status": "ready"}
+
+    def _download():
+        try:
+            ensure_checkpoint_downloaded(filename)
+        except Exception as e:
+            print(f"  /prepare download failed for '{req.model}': {e}")
+
+    threading.Thread(target=_download, daemon=True).start()
+    return {"status": "download started"}
 
 
 @app.get("/corpus")

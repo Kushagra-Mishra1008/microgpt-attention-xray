@@ -1,17 +1,16 @@
 """
 FastAPI inference server for MicroGPT.
 
-Memory safety design (Render free tier caps at 512MB RAM):
+Memory & network safety design (Render free tier caps at 512MB RAM):
   - At most ONE model is ever loaded into memory at a time (evict-on-switch).
   - At most ONE checkpoint download ever happens at a time, system-wide,
-    enforced by a global lock -- this is what a previous version got wrong:
-    downloading multiple large files in an overlapping burst spiked memory
-    past the limit and got the process SIGKILLed (exit 137).
-  - Only the default model is pre-downloaded at startup; others download on
-    demand, either via /prepare (fired the moment the frontend selects a
-    model, well before the user submits a request) or synchronously inside
-    the request that actually needs them, whichever gets there first --
-    the lock makes both paths safe together.
+    enforced by a global lock -- overlapping large downloads previously
+    spiked memory past the limit and got the process SIGKILLed (exit 137).
+  - Only the default model is pre-downloaded at startup; the rest download
+    on demand, either via /prepare (fired the moment the frontend selects a
+    model) or synchronously inside the request that needs them.
+  - A global socket timeout prevents any stalled network call (e.g. a flaky
+    connection to GitHub or Hugging Face) from hanging startup forever.
 
 Run with:
     python -m uvicorn server.main:app --reload --port 8080
@@ -20,9 +19,12 @@ Run with:
 import os
 import gc
 import json
+import socket
 import asyncio
 import threading
 import urllib.request
+
+socket.setdefaulttimeout(30)  # no network call can hang forever
 
 import torch
 import torch.nn.functional as F
@@ -186,7 +188,12 @@ def get_model(name):
 @app.on_event("startup")
 def startup():
     global CORPUS_TEXT
-    ensure_data_downloaded()
+
+    try:
+        ensure_data_downloaded()
+    except Exception as e:
+        print(f"WARNING: failed to download corpus data at startup: {e}")
+
     try:
         with open("data/train.txt", "r", encoding="utf-8") as f:
             train_text = f.read()

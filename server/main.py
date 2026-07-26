@@ -1,9 +1,10 @@
 """
 FastAPI inference server for MicroGPT.
 
-Loads whichever trained checkpoints are available in checkpoints/ at startup.
-Supports both char-level and BPE (word-level) checkpoints -- tokenizer type
-is auto-detected from what's saved inside each checkpoint file.
+On startup: downloads any missing checkpoint files from Hugging Face Hub,
+downloads the training corpus if missing, then loads whatever checkpoints
+are available. Supports both char-level and BPE (word-level) checkpoints --
+tokenizer type is auto-detected from what's saved inside each checkpoint.
 
 Run with:
     python -m uvicorn server.main:app --reload --port 8080
@@ -12,6 +13,7 @@ Run with:
 import os
 import json
 import asyncio
+import urllib.request
 
 import torch
 import torch.nn.functional as F
@@ -30,6 +32,11 @@ from server.schemas import (
 CHECKPOINT_DIR = "checkpoints"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+HF_REPO = "Kushagra-Mishra1008/microgpt-attention-xray-checkpoints"
+HF_BASE_URL = f"https://huggingface.co/{HF_REPO}/resolve/main"
+
+SHAKESPEARE_URL = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
+
 app = FastAPI(title="MicroGPT Attention X-Ray API")
 
 app.add_middleware(
@@ -40,6 +47,47 @@ app.add_middleware(
 )
 
 LOADED_MODELS = {}
+CORPUS_TEXT = ""
+
+
+def ensure_checkpoint_downloaded(filename):
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    path = os.path.join(CHECKPOINT_DIR, filename)
+    if os.path.exists(path):
+        return path
+
+    url = f"{HF_BASE_URL}/{filename}"
+    print(f"  downloading {filename} from Hugging Face Hub...")
+    try:
+        urllib.request.urlretrieve(url, path)
+        print(f"  done: {filename}")
+        return path
+    except Exception as e:
+        print(f"  failed to download {filename}: {e}")
+        if os.path.exists(path):
+            os.remove(path)
+        return None
+
+
+def ensure_data_downloaded():
+    os.makedirs("data", exist_ok=True)
+    train_path = os.path.join("data", "train.txt")
+    val_path = os.path.join("data", "val.txt")
+    if os.path.exists(train_path) and os.path.exists(val_path):
+        return
+
+    print("  data/train.txt or data/val.txt missing -- downloading Tiny Shakespeare...")
+    raw_path = os.path.join("data", "shakespeare.txt")
+    urllib.request.urlretrieve(SHAKESPEARE_URL, raw_path)
+    with open(raw_path, "r", encoding="utf-8") as f:
+        text = f.read()
+
+    split_idx = int(len(text) * 0.9)
+    with open(train_path, "w", encoding="utf-8") as f:
+        f.write(text[:split_idx])
+    with open(val_path, "w", encoding="utf-8") as f:
+        f.write(text[split_idx:])
+    print("  data ready.")
 
 
 def build_tokenizer_from_checkpoint(tok_dict):
@@ -54,8 +102,8 @@ def build_tokenizer_from_checkpoint(tok_dict):
 
 
 def load_checkpoint(name, filename):
-    path = os.path.join(CHECKPOINT_DIR, filename)
-    if not os.path.exists(path):
+    path = ensure_checkpoint_downloaded(filename)
+    if path is None or not os.path.exists(path):
         return None
 
     checkpoint = torch.load(path, map_location=DEVICE, weights_only=False)
@@ -83,6 +131,7 @@ def load_checkpoint(name, filename):
         })
     else:
         print(f"  '{name}' checkpoint has no saved tokenizer -- rebuilding from data files")
+        ensure_data_downloaded()
         with open("data/train.txt", "r", encoding="utf-8") as f:
             train_text = f.read()
         with open("data/val.txt", "r", encoding="utf-8") as f:
@@ -102,6 +151,10 @@ def load_checkpoint(name, filename):
 
 @app.on_event("startup")
 def startup():
+    global CORPUS_TEXT
+
+    ensure_data_downloaded()
+
     candidates = {
         "small-char": "checkpoint_small_char.pt",
         "medium-char": "checkpoint_medium_char.pt",
@@ -119,7 +172,22 @@ def startup():
             print(f"loaded '{name}' ({loaded['tokenizer_type']}, "
                   f"val_loss={loaded['val_loss']:.4f}, vocab_size={loaded['config']['vocab_size']})")
     if not LOADED_MODELS:
-        print(f"WARNING: no checkpoints found in {CHECKPOINT_DIR}/")
+        print(f"WARNING: no checkpoints could be loaded")
+
+    try:
+        with open("data/train.txt", "r", encoding="utf-8") as f:
+            train_text = f.read()
+        with open("data/val.txt", "r", encoding="utf-8") as f:
+            val_text = f.read()
+        CORPUS_TEXT = train_text + val_text
+        print(f"loaded corpus text ({len(CORPUS_TEXT):,} characters)")
+    except FileNotFoundError:
+        print("WARNING: could not load corpus text -- /corpus will be empty")
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "models_loaded": list(LOADED_MODELS.keys())}
 
 
 def get_model_or_404(name):
@@ -146,6 +214,15 @@ def list_models():
         )
         for name, entry in LOADED_MODELS.items()
     ]
+
+
+@app.get("/corpus")
+def get_corpus():
+    return {
+        "text": CORPUS_TEXT,
+        "length": len(CORPUS_TEXT),
+        "source": "Tiny Shakespeare",
+    }
 
 
 @app.post("/tokenize", response_model=TokenizeResponse)

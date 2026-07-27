@@ -49,12 +49,14 @@ HF_BASE_URL = f"https://huggingface.co/{HF_REPO}/resolve/main"
 
 SHAKESPEARE_URL = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
 
+# Only the small models are servable on this branch -- Render's free tier
+# (512MB RAM) can't reliably hold the medium checkpoints alongside PyTorch's
+# own baseline memory footprint. The medium models still exist and are
+# servable on `main` for local dev / a future bigger host.
 MODEL_REGISTRY = {
-    "small-char":  {"filename": "checkpoint_small_char.pt",  "tokenizer_type": "char", "n_embd": 384, "n_head": 6, "n_layer": 6, "block_size": 256, "vocab_size": 65,   "val_loss": 1.5414},
-    "medium-char": {"filename": "checkpoint_medium_char.pt", "tokenizer_type": "char", "n_embd": 512, "n_head": 8, "n_layer": 8, "block_size": 256, "vocab_size": 65,   "val_loss": 1.4852},
-    "small-word":  {"filename": "checkpoint_small_word.pt",  "tokenizer_type": "bpe",  "n_embd": 384, "n_head": 6, "n_layer": 6, "block_size": 256, "vocab_size": 3065, "val_loss": 4.5400},
-    "medium-word": {"filename": "checkpoint_medium_word.pt", "tokenizer_type": "bpe",  "n_embd": 512, "n_head": 8, "n_layer": 8, "block_size": 256, "vocab_size": 3065, "val_loss": 4.5671},
-}
+    "small-char": {"filename": "checkpoint_small_char.pt", "tokenizer_type": "char", "n_embd": 384, "n_head": 6, "n_layer": 6, "block_size": 256, "vocab_size": 65,   "val_loss": 1.5414},
+    "small-word": {"filename": "checkpoint_small_word.pt", "tokenizer_type": "bpe",  "n_embd": 384, "n_head": 6, "n_layer": 6, "block_size": 256, "vocab_size": 3065, "val_loss": 4.5400},
+}}
 
 app = FastAPI(title="MicroGPT Attention X-Ray API")
 

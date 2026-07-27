@@ -11,13 +11,16 @@ export default function Generate({ selectedModel }) {
 
   function start() {
     setGeneratedText(prompt);
+    setLastWeight(null);
     setIsGenerating(true);
     streamRef.current = streamGenerate(
       { prompt, max_new_tokens: 300, temperature, model: selectedModel },
       (payload) => {
         setGeneratedText((prev) => prev + payload.token);
-        const maxAttn = Math.max(...payload.attention_row);
-        setLastWeight(maxAttn);
+        const flat = (payload.attention_row ?? [])
+          .flat(Infinity)
+          .filter((n) => typeof n === "number" && !isNaN(n));
+        if (flat.length) setLastWeight(Math.max(...flat));
       },
       () => setIsGenerating(false)
     );
@@ -30,7 +33,17 @@ export default function Generate({ selectedModel }) {
 
   return (
     <>
-      <div className="canvas" style={{ minHeight: 60, flexDirection: "row", alignItems: "center", gap: 24 }}>
+      <div
+        className="canvas"
+        style={{
+          minHeight: 60,
+          flexDirection: "row",
+          alignItems: "center",
+          gap: 24,
+          minWidth: 0,
+          flexWrap: "wrap",
+        }}
+      >
         <div className="slider-group" style={{ maxWidth: 320 }}>
           <div className="row">
             <span>Temperature</span>
@@ -57,8 +70,18 @@ export default function Generate({ selectedModel }) {
         <input value={prompt} onChange={(e) => setPrompt(e.target.value)} disabled={isGenerating} />
       </div>
 
-      <div className="canvas">
-        <p style={{ fontFamily: "var(--mono)", fontSize: 14, lineHeight: 1.7, whiteSpace: "pre-wrap" }}>
+      <div className="canvas" style={{ minWidth: 0 }}>
+        <p
+          style={{
+            fontFamily: "var(--mono)",
+            fontSize: 14,
+            lineHeight: 1.7,
+            whiteSpace: "pre-wrap",
+            wordBreak: "break-word",
+            overflowWrap: "break-word",
+            margin: 0,
+          }}
+        >
           {generatedText || "Press Generate to stream text from the model."}
           {isGenerating && <span style={{ opacity: 0.5 }}>▍</span>}
         </p>

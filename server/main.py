@@ -1,16 +1,20 @@
 """
 FastAPI inference server for MicroGPT.
 
-Memory & network safety design (Render free tier caps at 512MB RAM):
-  - At most ONE model is ever loaded into memory at a time (evict-on-switch).
-  - At most ONE checkpoint download ever happens at a time, system-wide,
-    enforced by a global lock -- overlapping large downloads previously
-    spiked memory past the limit and got the process SIGKILLed (exit 137).
-  - Only the default model is pre-downloaded at startup; the rest download
-    on demand, either via /prepare (fired the moment the frontend selects a
-    model) or synchronously inside the request that needs them.
-  - A global socket timeout prevents any stalled network call (e.g. a flaky
-    connection to GitHub or Hugging Face) from hanging startup forever.
+Memory safety design (Render free tier caps at 512MB RAM):
+  - Only the small models are servable here; the medium checkpoints exist on
+    `main` for local dev but are too large to hold alongside PyTorch's own
+    baseline memory footprint on a 512MB host.
+  - Models are constructed on the 'meta' device (architecture only, no real
+    memory for weights), then the checkpoint's tensors are assigned directly
+    via load_state_dict(..., assign=True) -- this avoids ever holding two
+    full copies of the weights at once.
+  - At most ONE model is in memory at a time, guarded by MODEL_LOCK so a
+    concurrent /prepare and /attention can't race each other into a
+    half-evicted state.
+  - At most ONE download happens at a time, guarded by DOWNLOAD_LOCK.
+  - A global socket timeout prevents a stalled network call from hanging
+    startup forever.
 
 Run with:
     python -m uvicorn server.main:app --reload --port 8080
@@ -24,10 +28,13 @@ import asyncio
 import threading
 import urllib.request
 
-socket.setdefaulttimeout(30)  # no network call can hang forever
+socket.setdefaulttimeout(30)
 
 import torch
 import torch.nn.functional as F
+
+torch.set_num_threads(1)
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -41,7 +48,7 @@ from server.schemas import (
 )
 
 CHECKPOINT_DIR = "checkpoints"
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE = "cpu"
 DEFAULT_MODEL = "small-char"
 
 HF_REPO = "Kushagra-Mishra1008/microgpt-attention-xray-checkpoints"
@@ -49,10 +56,6 @@ HF_BASE_URL = f"https://huggingface.co/{HF_REPO}/resolve/main"
 
 SHAKESPEARE_URL = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
 
-# Only the small models are servable on this branch -- Render's free tier
-# (512MB RAM) can't reliably hold the medium checkpoints alongside PyTorch's
-# own baseline memory footprint. The medium models still exist and are
-# servable on `main` for local dev / a future bigger host.
 MODEL_REGISTRY = {
     "small-char": {"filename": "checkpoint_small_char.pt", "tokenizer_type": "char", "n_embd": 384, "n_head": 6, "n_layer": 6, "block_size": 256, "vocab_size": 65,   "val_loss": 1.5414},
     "small-word": {"filename": "checkpoint_small_word.pt", "tokenizer_type": "bpe",  "n_embd": 384, "n_head": 6, "n_layer": 6, "block_size": 256, "vocab_size": 3065, "val_loss": 4.5400},
@@ -70,6 +73,7 @@ app.add_middleware(
 CURRENT = None
 CORPUS_TEXT = ""
 DOWNLOAD_LOCK = threading.Lock()
+MODEL_LOCK = threading.Lock()
 
 
 def checkpoint_path(filename):
@@ -134,57 +138,66 @@ def build_tokenizer_from_checkpoint(tok_dict):
     return CharTokenizer.from_dict(tok_dict)
 
 
+def free_current():
+    """Caller MUST hold MODEL_LOCK."""
+    global CURRENT
+    if CURRENT is not None:
+        print(f"  evicting '{CURRENT['name']}'")
+        CURRENT = None
+        gc.collect()
+
+
 def get_model(name):
     global CURRENT
 
     if name not in MODEL_REGISTRY:
         raise HTTPException(status_code=404, detail=f"unknown model '{name}'. available: {list(MODEL_REGISTRY.keys())}")
 
-    if CURRENT is not None and CURRENT["name"] == name:
-        return CURRENT
+    with MODEL_LOCK:
+        if CURRENT is not None and CURRENT["name"] == name:
+            return CURRENT
 
-    if CURRENT is not None:
-        print(f"  evicting '{CURRENT['name']}' to load '{name}'")
-        del CURRENT["model"]
-        CURRENT = None
+        free_current()
+
+        reg = MODEL_REGISTRY[name]
+        path = ensure_checkpoint_downloaded(reg["filename"])
+        checkpoint = torch.load(path, map_location=DEVICE, weights_only=False)
+        config = checkpoint["config"]
+
+        with torch.device("meta"):
+            model = GPTLanguageModel(
+                vocab_size=config["vocab_size"],
+                n_embd=config["n_embd"],
+                n_head=config["n_head"],
+                n_layer=config["n_layer"],
+                block_size=config["block_size"],
+            )
+        model.load_state_dict(checkpoint["model_state_dict"], assign=True)
+        model.eval()
+
+        tok_dict = checkpoint.get("tokenizer")
+        if tok_dict is not None:
+            tokenizer = build_tokenizer_from_checkpoint(tok_dict)
+        elif "stoi" in checkpoint and "itos" in checkpoint:
+            tokenizer = CharTokenizer.from_dict({
+                "stoi": checkpoint["stoi"],
+                "itos": {str(k): v for k, v in checkpoint["itos"].items()},
+                "vocab_size": config["vocab_size"],
+            })
+        else:
+            ensure_data_downloaded()
+            with open("data/train.txt", "r", encoding="utf-8") as f:
+                train_text = f.read()
+            with open("data/val.txt", "r", encoding="utf-8") as f:
+                val_text = f.read()
+            tokenizer = CharTokenizer(train_text + val_text)
+
+        del checkpoint
         gc.collect()
 
-    reg = MODEL_REGISTRY[name]
-    path = ensure_checkpoint_downloaded(reg["filename"])
-    checkpoint = torch.load(path, map_location=DEVICE, weights_only=False)
-    config = checkpoint["config"]
-
-    model = GPTLanguageModel(
-        vocab_size=config["vocab_size"],
-        n_embd=config["n_embd"],
-        n_head=config["n_head"],
-        n_layer=config["n_layer"],
-        block_size=config["block_size"],
-    )
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.to(DEVICE)
-    model.eval()
-
-    tok_dict = checkpoint.get("tokenizer")
-    if tok_dict is not None:
-        tokenizer = build_tokenizer_from_checkpoint(tok_dict)
-    elif "stoi" in checkpoint and "itos" in checkpoint:
-        tokenizer = CharTokenizer.from_dict({
-            "stoi": checkpoint["stoi"],
-            "itos": {str(k): v for k, v in checkpoint["itos"].items()},
-            "vocab_size": config["vocab_size"],
-        })
-    else:
-        ensure_data_downloaded()
-        with open("data/train.txt", "r", encoding="utf-8") as f:
-            train_text = f.read()
-        with open("data/val.txt", "r", encoding="utf-8") as f:
-            val_text = f.read()
-        tokenizer = CharTokenizer(train_text + val_text)
-
-    print(f"  loaded '{name}'")
-    CURRENT = {"name": name, "model": model, "tokenizer": tokenizer, "config": config}
-    return CURRENT
+        print(f"  loaded '{name}'")
+        CURRENT = {"name": name, "model": model, "tokenizer": tokenizer, "config": config}
+        return CURRENT
 
 
 @app.on_event("startup")
@@ -240,18 +253,12 @@ def list_models():
 
 @app.post("/prepare")
 def prepare_model(req: PrepareRequest):
-    global CURRENT
     if req.model not in MODEL_REGISTRY:
         raise HTTPException(status_code=404, detail=f"unknown model '{req.model}'")
 
-    # Free the currently-loaded model immediately on selection, so we never
-    # hold one model in RAM while downloading a different one -- that overlap
-    # is what pushed memory past 512MB and got the process killed.
-    if CURRENT is not None and CURRENT["name"] != req.model:
-        print(f"  evicting '{CURRENT['name']}' (switched selection before it was requested)")
-        del CURRENT["model"]
-        CURRENT = None
-        gc.collect()
+    with MODEL_LOCK:
+        if CURRENT is not None and CURRENT["name"] != req.model:
+            free_current()
 
     filename = MODEL_REGISTRY[req.model]["filename"]
     if is_downloaded(filename):

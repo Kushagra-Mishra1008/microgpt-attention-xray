@@ -56,7 +56,7 @@ SHAKESPEARE_URL = "https://raw.githubusercontent.com/karpathy/char-rnn/master/da
 MODEL_REGISTRY = {
     "small-char": {"filename": "checkpoint_small_char.pt", "tokenizer_type": "char", "n_embd": 384, "n_head": 6, "n_layer": 6, "block_size": 256, "vocab_size": 65,   "val_loss": 1.5414},
     "small-word": {"filename": "checkpoint_small_word.pt", "tokenizer_type": "bpe",  "n_embd": 384, "n_head": 6, "n_layer": 6, "block_size": 256, "vocab_size": 3065, "val_loss": 4.5400},
-}}
+}
 
 app = FastAPI(title="MicroGPT Attention X-Ray API")
 
